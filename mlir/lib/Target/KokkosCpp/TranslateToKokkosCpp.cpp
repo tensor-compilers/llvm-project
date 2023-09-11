@@ -18,6 +18,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Support/IndentedOstream.h"
 #include "mlir/Target/KokkosCpp/KokkosCppEmitter.h"
 #include "llvm/ADT/DenseMap.h"
@@ -36,6 +37,13 @@
 using namespace mlir;
 using namespace mlir::emitc;
 using llvm::formatv;
+
+enum ViewStorageType
+{
+  HOST,
+  DEVICE,
+  DUALVIEW
+};
 
 /// Convenience functions to produce interleaved output with functions returning
 /// a LogicalResult. This is different than those in STLExtras as functions used
@@ -178,6 +186,30 @@ struct KokkosParallelEnv{
     bool insideTeamRange_, insideTeamThreadRange_, insideThreadVectorRange_, insideTeamVectorRange_;
     bool useTeamRange_, useTeamThreadRange_, useThreadVectorRange_, useTeamVectorRange_;
 };
+
+// Helper to walk through all new values (BlockArguments and Operation results)
+template<typename Callback>
+void walkValues(Operation* startOp, Callback cb)
+{
+  //Process Operation results first
+  startOp->walk(
+      [&](Operation* op)
+      {
+        for(auto res : op->getResults())
+        {
+          cb(res);
+        }
+      });
+  //Then do all Block arguments
+  startOp->walk(
+      [&](Block* block)
+      {
+        for(auto blockArg : block->getArguments())
+        {
+          cb(blockArg);
+        }
+      });
+}
 
 namespace {
 struct KokkosCppEmitter {
@@ -1393,12 +1425,12 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, scf::ParallelOp o
   if(isReduction)
   {
     //Loop over the parallel body to get information about the reduction types
-    Region& body = op.getRegion();
+//    Region& body = op.getRegion();
 
     for (auto reduce : op.getOps<scf::ReduceOp>())
     {
-      Type type = reduce.getOperand().getType();
-      Block &reduction = reduce.getRegion().front();
+//      Type type = reduce.getOperand().getType();
+//      Block &reduction = reduce.getRegion().front();
       
       emitter << ", ";
 
@@ -1556,8 +1588,8 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, scf::ReduceOp red
   Block &reduction = reduceOp.getRegion().front();
 
   Operation *terminator = &reduceOp.getRegion().front().back();
-  assert(isa<scf::ReduceReturnOp>(terminator) &&
-         "expected reduce op to be terminated by redure return");
+  if(!isa<scf::ReduceReturnOp>(terminator))
+    return reduceOp.emitError("expected reduce op to be terminated by redure return");
 
   if (matchSimpleReduction<arith::AddFOp, LLVM::FAddOp>(reduction)) {
     os << emitter.getOrCreateName(reduceOp.getRegion().getOps().begin()->getResult(0));
@@ -3290,7 +3322,7 @@ static void emitCppBoilerplate(KokkosCppEmitter &emitter, bool enablePythonWrapp
 //Version for when we are just emitting C++
 LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool enableSparseSupport) {
   //Uncomment to pause so you can attach debugger
-  //pauseForDebugger();
+  pauseForDebugger();
   KokkosCppEmitter emitter(os, enableSparseSupport);
   emitCppBoilerplate(emitter, false, enableSparseSupport);
   KokkosParallelEnv kokkosParallelEnv(false);
@@ -3303,7 +3335,7 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool e
 //Version for when we are emitting both C++ and Python wrappers
 LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, raw_ostream &py_os, bool enableSparseSupport, bool useHierarchical) {
   //Uncomment to pause so you can attach debugger
-  //pauseForDebugger();
+  pauseForDebugger();
   KokkosCppEmitter emitter(os, py_os, enableSparseSupport);
   //Emit the C++ boilerplate to os
   emitCppBoilerplate(emitter, true, enableSparseSupport);
