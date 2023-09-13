@@ -216,6 +216,8 @@ struct KokkosCppEmitter {
   explicit KokkosCppEmitter(raw_ostream &os, bool enableSparseSupport);
   explicit KokkosCppEmitter(raw_ostream &os, raw_ostream& py_os, bool enableSparseSupport);
 
+  LogicalResult analyzeModule(ModuleOp op);
+
   /// Emits attribute or returns failure.
   LogicalResult emitAttribute(Location loc, Attribute attr);
 
@@ -438,6 +440,32 @@ private:
   //This just maps the SubViewOp result (the variable name) back to the SubViewOp,
   //so that the index multiplications can be generated when the subview is accessed by memref.load/memref.store.
   llvm::DenseMap<Value, memref::SubViewOp> stridedSubviews;
+
+  // For memrefs, a record of where the data is accessed (host, device, or both) and therefore how it is stored
+  llvm::DenseMap<Value, ViewStorageType> memrefStorage;
+
+  // For each scf.parallel op, whether the body can be executed on device
+  // (meaning, it contains no host-only operations like memref.alloc or func.call)
+  llvm::DenseMap<Value, bool> parallelOffloadable;
+
+  // For each scf.parallel op, the nesting depth.
+  // Top-level parallel is depth 0.
+  // Nested within that is depth 1, etc.
+  llvm::DenseMap<Value, bool> parallelDepth;
+
+  // For each scf.parallel op, the max nesting depth of any scf.parallel with the same depth-0 parent.
+  // For example, all these parallels would have maxDepth = 3:
+  // scf.parallel {
+  //  scf.parallel {
+  //    scf.parallel {
+  //      ...
+  //    }
+  //  }
+  //  scf.parallel {
+  //    ...
+  //  }
+  // }
+  llvm::DenseMap<Value, bool> parallelTreeMaxDepth;
 
   //Bookeeping for scalar constants (individual integer and floating-point values)
   mutable llvm::DenseMap<Value, arith::ConstantOp> scalarConstants;
@@ -2244,6 +2272,12 @@ void KokkosCppEmitter::populateSparseSupportFunctions()
   registerNonPrefixed(false, "endInsert");
 }
 
+LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp op)
+{
+  puts("Hello from analyzeModule!");
+  return success();
+}
+
 /// Return the existing or a new name for a Value.
 StringRef KokkosCppEmitter::getOrCreateName(Value val) {
   if (!valueMapper.count(val))
@@ -3321,11 +3355,17 @@ static void emitCppBoilerplate(KokkosCppEmitter &emitter, bool enablePythonWrapp
 
 //Version for when we are just emitting C++
 LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool enableSparseSupport) {
+  if(!isa<ModuleOp>(op))
+  {
+    return op->emitError("translateToKokkosCpp() can only accept a ModuleOp.");
+  }
   //Uncomment to pause so you can attach debugger
   pauseForDebugger();
   KokkosCppEmitter emitter(os, enableSparseSupport);
   emitCppBoilerplate(emitter, false, enableSparseSupport);
   KokkosParallelEnv kokkosParallelEnv(false);
+  if(failed(emitter.analyzeModule(dyn_cast<ModuleOp>(op))))
+    return failure();
   //Emit the actual module (global variables and functions)
   if(failed(emitter.emitOperation(*op, /*trailingSemicolon=*/false, kokkosParallelEnv)))
     return failure();
@@ -3334,6 +3374,10 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool e
 
 //Version for when we are emitting both C++ and Python wrappers
 LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, raw_ostream &py_os, bool enableSparseSupport, bool useHierarchical) {
+  if(!isa<ModuleOp>(op))
+  {
+    return op->emitError("translateToKokkosCpp() can only accept a ModuleOp.");
+  }
   //Uncomment to pause so you can attach debugger
   pauseForDebugger();
   KokkosCppEmitter emitter(os, py_os, enableSparseSupport);
@@ -3343,7 +3387,8 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, raw_os
   //Emit the ctypes boilerplate to py_os first - function wrappers need to come after this.
   if(failed(emitter.emitPythonBoilerplate()))
       return failure();
-  //Global preamble.
+  if(failed(emitter.analyzeModule(dyn_cast<ModuleOp>(op))))
+    return failure();
   //Emit the actual module (global variables and functions)
   if(failed(emitter.emitOperation(*op, /*trailingSemicolon=*/false, kokkosParallelEnv)))
     return failure();
