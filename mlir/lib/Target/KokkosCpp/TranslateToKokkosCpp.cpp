@@ -38,12 +38,14 @@ using namespace mlir;
 using namespace mlir::emitc;
 using llvm::formatv;
 
-enum ViewStorageType
+// Use values 1,2,3 so that HOST,DEVICE can be used as bit masks
+// (DUALVIEW == HOST | DEVICE)
+namespace ViewStorageType
 {
-  HOST,
-  DEVICE,
-  DUALVIEW
-};
+  static constexpr int HOST = 1;
+  static constexpr int DEVICE = 2;
+  static constexpr int DUALVIEW = HOST | DEVICE;
+}
 
 /// Convenience functions to produce interleaved output with functions returning
 /// a LogicalResult. This is different than those in STLExtras as functions used
@@ -211,7 +213,57 @@ void walkValues(Operation* startOp, Callback cb)
       });
 }
 
+struct ValueForestNode
+{
+  ValueForestNode() = default;
+  ValueForestNode(ValueForestNode* parent_, Value v_)
+    : parent(parent_), v(v_) {}
+
+  ValueForestNode* parent;
+  Value v;
+  std::vector<ValueForestNode*> children;
+};
+
+struct ValueForest
+{
+  //Add a root value (no parent), if it doesn't already exist
+  void addValue(Value v)
+  {
+    if(valueToNode.find(v) != valueToNode.end())
+      return;
+    valueToNode[v] = new ValueForestNode(nullptr, v);
+  }
+
+  //Add a value with parent, if it doesn't already exist.
+  //(The parent must already exist, though)
+  void addValue(Value v, Value parent)
+  {
+    if(valueToNode.find(v) != valueToNode.end())
+      return;
+    ValueForestNode* parentNode = valueToNode[parent];
+    valueToNode[v] = new ValueForestNode(parentNode, v);
+    parentNode->children.push_back(valueToNode[v]);
+  }
+
+  bool isRoot(Value v)
+  {
+    return valueToNode[v]->parent == nullptr;
+  }
+
+  Value getTopParent(Value v)
+  {
+    auto n = valueToNode[v];
+    if(n->parent)
+      return getTopParent(n->v);
+    //v has no parent, so return v
+    return v;
+  }
+
+  llvm::DenseMap<Value, ValueForestNode*> valueToNode;
+};
+
 namespace {
+
 struct KokkosCppEmitter {
   explicit KokkosCppEmitter(raw_ostream &os, bool enableSparseSupport);
   explicit KokkosCppEmitter(raw_ostream &os, raw_ostream& py_os, bool enableSparseSupport);
@@ -371,7 +423,7 @@ struct KokkosCppEmitter {
 
   void registerGlobalView(memref::GlobalOp op)
   {
-    globalViews.push_back(op);
+    globalViews[op.getSymName().str()] = op;
   }
 
   //Is v a scalar constant?
@@ -404,6 +456,9 @@ struct KokkosCppEmitter {
     }
     return span;
   }
+
+  ValueForest valueOwnership;
+  ValueForest memrefOwnership;
 
 private:
   using ValueMapper = llvm::ScopedHashTable<Value, std::string>;
@@ -442,16 +497,21 @@ private:
   llvm::DenseMap<Value, memref::SubViewOp> stridedSubviews;
 
   // For memrefs, a record of where the data is accessed (host, device, or both) and therefore how it is stored
-  llvm::DenseMap<Value, ViewStorageType> memrefStorage;
+  // Possible values are defined in ViewStorageType::
+  llvm::DenseMap<Value, int> memrefStorage;
 
-  // For each scf.parallel op, whether the body can be executed on device
+  // For each top-level scf.parallel op, whether the body can be executed on device
   // (meaning, it contains no host-only operations like memref.alloc or func.call)
-  llvm::DenseMap<Value, bool> parallelOffloadable;
+  llvm::DenseMap<scf::ParallelOp, bool> parallelOffloadable;
 
+  /*
+  // TODO: analyze parallel loop nesting ahead of time?
+  // May simplify the logic in KokkosParallelEnv
+  //
   // For each scf.parallel op, the nesting depth.
   // Top-level parallel is depth 0.
   // Nested within that is depth 1, etc.
-  llvm::DenseMap<Value, bool> parallelDepth;
+  llvm::DenseMap<scf::ParallelOp, bool> parallelDepth;
 
   // For each scf.parallel op, the max nesting depth of any scf.parallel with the same depth-0 parent.
   // For example, all these parallels would have maxDepth = 3:
@@ -465,15 +525,17 @@ private:
   //    ...
   //  }
   // }
-  llvm::DenseMap<Value, bool> parallelTreeMaxDepth;
+  llvm::DenseMap<scf::ParallelOp, bool> parallelTreeMaxDepth;
+  */
 
   //Bookeeping for scalar constants (individual integer and floating-point values)
   mutable llvm::DenseMap<Value, arith::ConstantOp> scalarConstants;
 
   //Bookeeping for Kokkos::Views in global scope.
+  //Each key is a global memrefs's name, and each value is the op that generated it.
   //Each element has a name, element type, total size and whether it is intialized.
   //If initialized, ${name}_initial is assumed to be a global 1D host array with the data.
-  std::vector<memref::GlobalOp> globalViews;
+  llvm::DenseMap<std::string, memref::GlobalOp> globalViews;
 
   // This is a string-string map
   // Keys are the names of sparse runtime support functions as they appear in the IR
@@ -2272,9 +2334,169 @@ void KokkosCppEmitter::populateSparseSupportFunctions()
   registerNonPrefixed(false, "endInsert");
 }
 
-LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp op)
+LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
 {
-  puts("Hello from analyzeModule!");
+  // Step 1: determine memref ownership (populate valueOwnership and memrefOwnership)
+  // - First, log all memref-typed BlockArguments as self-owning
+  startOp->walk(
+      [&](Block* block)
+      {
+        for(auto blockArg : block->getArguments())
+        {
+          if(blockArg.getType().isa<MemRefType>())
+          {
+            valueOwnership.addValue(blockArg);
+            memrefOwnership.addValue(blockArg);
+          }
+        }
+      });
+  // - Next, walk through operations and record ownership for any memrefs that get generated
+  startOp->walk<mlir::WalkOrder::PreOrder>(
+      [&](Operation* op)
+      {
+        // op generated a memref result, so inspect op
+        // to figure out what its owning value/memref (if any) are
+        
+        // These ops generate new, self-owning memrefs:
+        // - memref::GlobalOp
+        // - memref::AllocOp
+        // - memref::AllocaOp
+        // - memref::CopyOp (it's always a deep copy)
+        //
+        // These ops generate memrefs which are owned by another memref:
+        // - memref::GetGlobalOp
+        // - memref::SubViewOp
+        // - memref::CollapseShapeOp
+        // - memref::CastOp
+        //
+        // And finally, these generate memrefs which are owned by a non-memref parent:
+        // - func::CallOp to functions _mlir_ciface_sparse[Values, Indices, Pointers]
+        llvm::TypeSwitch<Operation *, void>(op)
+          .Case<memref::GlobalOp, memref::AllocOp, memref::AllocaOp, memref::CopyOp>([&](auto op)
+            {
+              // these ops all produce exactly one result, which is the self-owned memref
+              Value result = op.getResult(0);
+              valueOwnership.addValue(result);
+              memrefOwnership.addValue(result);
+            })
+          .Case<memref::GetGlobalOp, memref::SubViewOp, memref::CollapseShapeOp, memref::CastOp>([&](auto op)
+            {
+            })
+          .Case<func::FuncOp>([&](auto op)
+            {
+            });
+      });
+  // Step 2: go through all top-level parallel loops 
+  // and see if they can be offloaded to device.
+  // List of ops that we assume can't run on device:
+  //  - func.call
+  //  - memref.alloc
+  //  - memref.dealloc
+  //  - memref.alloca
+  startOp->walk<mlir::WalkOrder::PreOrder>(
+      [&](scf::ParallelOp op)
+      {
+        //Note: this outer callback will only be invoked only for top-level ParallelOps,
+        //because it always returns WalkResult::Skip. Nested ParallelOps are
+        //skipped over, but will be visited by the inner walk.
+        bool mustRunOnHost = false;
+        op.walk([&](Operation* op) -> mlir::WalkResult
+          {
+            if(isa<func::CallOp>(op) || isa<memref::AllocOp>(op) || isa<memref::DeallocOp>(op) || isa<memref::AllocaOp>(op)) {
+              mustRunOnHost = true;
+            }
+            if(mustRunOnHost)
+              return mlir::WalkResult::interrupt();
+            else
+              return mlir::WalkResult::advance();
+          });
+        parallelOffloadable[op] = !mustRunOnHost;
+      });
+  // Step 3: track where each memref gets accessed (host, device, or both)
+  {
+    auto processMemrefAccess = [&](Operation* op, bool onDevice)
+    {
+      Value mr;
+      if(isa<memref::StoreOp>(op))
+      {
+        auto storeOp = dyn_cast<memref::StoreOp>(op);
+        mr = storeOp.getMemRef();
+      }
+      else if(isa<memref::LoadOp>(op))
+      {
+        auto loadOp = dyn_cast<memref::LoadOp>(op);
+        mr = loadOp.getMemRef();
+      }
+      if(memrefStorage.find(mr) != memrefStorage.end())
+        memrefStorage[mr] |= (onDevice ? ViewStorageType::DEVICE : ViewStorageType::HOST);
+      else
+        memrefStorage[mr] = (onDevice ? ViewStorageType::DEVICE : ViewStorageType::HOST);
+    };
+    startOp->walk<mlir::WalkOrder::PreOrder>(
+        [&](Operation* op)
+        {
+          if(isa<scf::ParallelOp>(op))
+          {
+            auto parOp = dyn_cast<scf::ParallelOp>(op);
+            bool onDevice = parallelOffloadable[parOp];
+            //Walk the body of this parallel, and record all memref accesses
+            op->walk(
+              [&](Operation* op2)
+              {
+                if(isa<memref::StoreOp>(op2) || isa<memref::LoadOp>(op2))
+                  processMemrefAccess(op2, onDevice);
+              });
+            // Don't process the parallel body in the outer walk
+            return mlir::WalkResult::skip();
+          }
+          else if(isa<memref::StoreOp>(op) || isa<memref::LoadOp>(op))
+          {
+            //Have a load or store outside of a parallel region
+            processMemrefAccess(op, false);
+          }
+          else if(isa<func::CallOp>(op))
+          {
+            // Check call arguments, and assume any memref-typed operands are accessed on the host.
+            for(auto operand : op->getOperands())
+            {
+              if(operand.getType().isa<MemRefType>())
+              {
+                if(memrefStorage.find(operand) != memrefStorage.end())
+                  memrefStorage[operand] |= ViewStorageType::HOST;
+                else
+                  memrefStorage[operand] = ViewStorageType::HOST;
+              }
+            }
+          }
+          return mlir::WalkResult::advance();
+        });
+    // Now that all direct accesses have been logged, also make each parent memref shares the access location(s) of its children.
+    // For example, if a memref is stored as a DualView, then its parent, parent's parent, etc. must all be DualViews also.
+    for(auto node : memrefOwnership.valueToNode)
+    {
+      //Only process top-down (from roots) for efficiency
+      if(!node.getSecond()->parent)
+      {
+        std::function<void(ValueForestNode*)> visit =
+          [&](ValueForestNode* node) -> void
+          {
+            for(auto child : node->children)
+              visit(child);
+            int nodeStorageType = memrefStorage[node->v];
+            for(auto child : node->children)
+              nodeStorageType |= memrefStorage[child->v];
+            memrefStorage[node->v] = nodeStorageType;
+          };
+        visit(node.getSecond());
+      }
+    }
+  }
+  /*
+  llvm::DenseMap<scf::ParallelOp, bool> parallelOffloadable;
+  llvm::DenseMap<Value, int> memrefStorage;
+  llvm::DenseMap<Value, bool> parallelDepth;
+  llvm::DenseMap<Value, bool> parallelTreeMaxDepth;
+  */
   return success();
 }
 
@@ -3063,16 +3285,18 @@ LogicalResult KokkosCppEmitter::emitInitAndFinalize()
   os.indent();
   os << "Kokkos::initialize();\n";
   //For each global view: allocate it, and if there is initializing data, copy it
-  for(auto& op : globalViews)
+  for(auto& gv : globalViews)
   {
+    std::string name = gv.getFirst();
+    memref::GlobalOp op = gv.getSecond();
     os << "{\n";
     os.indent();
-    os << op.getSymName() << " = ";
+    os << name << " = ";
     if(failed(emitType(op.getLoc(), op.getType())))
       return failure();
     //TODO: handle dynamic sized view here. This assumes all compile time sizes.
     MemRefType type = op.getType().cast<MemRefType>();
-    os << "(Kokkos::view_alloc(Kokkos::WithoutInitializing, \"" << op.getSymName() << "\"));\n";
+    os << "(Kokkos::view_alloc(Kokkos::WithoutInitializing, \"" << name << "\"));\n";
     auto maybeValue = op.getInitialValue();
     if(maybeValue)
     {
@@ -3082,11 +3306,11 @@ LogicalResult KokkosCppEmitter::emitInitAndFinalize()
       os << "Kokkos::View<";
       if(failed(emitType(op.getLoc(), type.getElementType())))
         return failure();
-      os << "*> tempDst(" << op.getSymName() << ".data(), " << span << ");\n";
+      os << "*> tempDst(" << name << ".data(), " << span << ");\n";
       os << "Kokkos::View<";
       if(failed(emitType(op.getLoc(), type.getElementType())))
         return failure();
-      os << "*, Kokkos::HostSpace> tempSrc(" << op.getSymName() << "_initial, " << span << ");\n";
+      os << "*, Kokkos::HostSpace> tempSrc(" << name << "_initial, " << span << ");\n";
       os << "Kokkos::deep_copy(exec_space(), tempDst, tempSrc);\n";
     }
     os.unindent();
@@ -3097,9 +3321,11 @@ LogicalResult KokkosCppEmitter::emitInitAndFinalize()
   os << "extern \"C\" void kokkos_mlir_finalize()\n";
   os << "{\n";
   os.indent();
-  for(auto& op : globalViews)
+  for(auto& gv : globalViews)
   {
-    os << op.getSymName() << " = ";
+    std::string name = gv.getFirst();
+    memref::GlobalOp op = gv.getSecond();
+    os << name << " = ";
     if(failed(emitType(op.getLoc(), op.getType())))
       return failure();
     os << "();\n";
