@@ -322,6 +322,7 @@ struct KokkosCppEmitter {
   explicit KokkosCppEmitter(raw_ostream &os, raw_ostream& py_os, bool enableSparseSupport);
 
   LogicalResult analyzeModule(ModuleOp op);
+  void emitAnalysisSummary();
 
   /// Emits attribute or returns failure.
   LogicalResult emitAttribute(Location loc, Attribute attr);
@@ -386,32 +387,6 @@ struct KokkosCppEmitter {
 
   /// Whether to map an mlir integer to a unsigned integer in C++.
   bool shouldMapToUnsigned(IntegerType::SignednessSemantics val);
-
-  /// RAII helper function to manage entering/exiting C++ scopes.
-  struct Scope {
-    Scope(KokkosCppEmitter &emitter)
-        : valueMapperScope(emitter.valueMapper),
-          blockMapperScope(emitter.blockMapper), emitter(emitter) {
-      emitter.valueInScopeCount.push(emitter.valueInScopeCount.top());
-      emitter.labelInScopeCount.push(emitter.labelInScopeCount.top());
-    }
-    ~Scope() {
-      emitter.valueInScopeCount.pop();
-      emitter.labelInScopeCount.pop();
-    }
-
-  private:
-    llvm::ScopedHashTableScope<Value, std::string> valueMapperScope;
-    llvm::ScopedHashTableScope<Block *, std::string> blockMapperScope;
-
-    KokkosCppEmitter &emitter;
-  };
-
-  /// Returns wether the Value is assigned to a C++ variable in the scope.
-  bool hasValueInScope(Value val);
-
-  // Returns whether a label is assigned to the block.
-  bool hasBlockLabel(Block &block);
 
   /// Returns the C++ output stream.
   raw_indented_ostream &ostream() { return os; };
@@ -514,8 +489,8 @@ struct KokkosCppEmitter {
   ValueForest memrefOwnership;
 
 private:
-  using ValueMapper = llvm::ScopedHashTable<Value, std::string>;
-  using BlockMapper = llvm::ScopedHashTable<Block *, std::string>;
+  using ValueMapper = llvm::DenseMap<Value, std::string>;
+  using BlockMapper = llvm::DenseMap<Block *, std::string>;
 
   /// C++ output stream to emit to.
   raw_indented_ostream os;
@@ -535,8 +510,8 @@ private:
 
   /// The number of values in the current scope. This is used to declare the
   /// names of values in a scope.
-  std::stack<int64_t> valueInScopeCount;
-  std::stack<int64_t> labelInScopeCount;
+  int64_t valueCount;
+  int64_t labelCount;
   
   /// Whether we are currently emitting the body of a device function 
   bool insideDeviceCode = false;
@@ -549,6 +524,7 @@ private:
   //so that the index multiplications can be generated when the subview is accessed by memref.load/memref.store.
   llvm::DenseMap<Value, memref::SubViewOp> stridedSubviews;
 
+public:
   // For memrefs, a record of where the data is accessed (host, device, or both) and therefore how it is stored
   // Possible values are defined in ViewStorageType::
   llvm::DenseMap<Value, int> memrefStorage;
@@ -581,6 +557,7 @@ private:
   llvm::DenseMap<scf::ParallelOp, bool> parallelTreeMaxDepth;
   */
 
+private:
   //Bookeeping for scalar constants (individual integer and floating-point values)
   mutable llvm::DenseMap<Value, arith::ConstantOp> scalarConstants;
 
@@ -992,82 +969,6 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
   return printConstantOp(emitter, operation, value);
 }
 
-/*
-static LogicalResult printOperation(KokkosCppEmitter &emitter,
-                                    cf::BranchOp branchOp) {
-  raw_ostream &os = emitter.ostream();
-
-  for (auto pair :
-       llvm::zip(branchOp.getOperands(), successor.getArguments())) {
-    Value &operand = std::get<0>(pair);
-    BlockArgument &argument = std::get<1>(pair);
-    os << emitter.getOrCreateName(argument) << " = "
-       << emitter.getOrCreateName(operand) << ";\n";
-  }
-
-  os << "goto ";
-  if (!(emitter.hasBlockLabel(successor)))
-    return branchOp.emitOpError("unable to find label for successor block");
-  os << emitter.getOrCreateName(successor);
-  return success();
-}
-
-static LogicalResult printOperation(KokkosCppEmitter &emitter,
-                                    cf::CondBranchOp condBranchOp) {
-  raw_indented_ostream &os = emitter.ostream();
-  Block &trueSuccessor = *condBranchOp.getTrueDest();
-  Block &falseSuccessor = *condBranchOp.getFalseDest();
-
-  os << "if (" << emitter.getOrCreateName(condBranchOp.getCondition())
-     << ") {\n";
-
-  os.indent();
-
-  // If condition is true.
-  for (auto pair : llvm::zip(condBranchOp.getTrueOperands(),
-                             trueSuccessor.getArguments())) {
-    Value &operand = std::get<0>(pair);
-    BlockArgument &argument = std::get<1>(pair);
-    os << emitter.getOrCreateName(argument) << " = "
-       << emitter.getOrCreateName(operand) << ";\n";
-  }
-
-  os << "goto ";
-  if (!(emitter.hasBlockLabel(trueSuccessor))) {
-    return condBranchOp.emitOpError("unable to find label for successor block");
-  }
-  os << emitter.getOrCreateName(trueSuccessor) << ";\n";
-  os.unindent() << "} else {\n";
-  os.indent();
-  // If condition is false.
-  for (auto pair : llvm::zip(condBranchOp.getFalseOperands(),
-                             falseSuccessor.getArguments())) {
-    Value &operand = std::get<0>(pair);
-    BlockArgument &argument = std::get<1>(pair);
-    os << emitter.getOrCreateName(argument) << " = "
-       << emitter.getOrCreateName(operand) << ";\n";
-  }
-
-  os << "goto ";
-  if (!(emitter.hasBlockLabel(falseSuccessor))) {
-    return condBranchOp.emitOpError()
-           << "unable to find label for successor block";
-  }
-  os << emitter.getOrCreateName(falseSuccessor) << ";\n";
-  os.unindent() << "}";
-  return success();
-}
-
-static LogicalResult printOperation(KokkosCppEmitter &emitter,
-                                    cf::AssertOp op) {
-  emitter << "if(!" << emitter.getOrCreateName(op.getArg()) << ") Kokkos::abort(";
-  if(failed(emitter.emitAttribute(op.getLoc(), op.getMsgAttr())))
-    return failure();
-  emitter << ")";
-  return success();
-}
-*/
-
 static LogicalResult printSupportCall(KokkosCppEmitter &emitter, func::CallOp callOp)
 {
   // NOTE: do not currently support multiple return values (a tuple) from support functions,
@@ -1432,6 +1333,13 @@ static LogicalResult printSeralOperation(KokkosCppEmitter &emitter, scf::Paralle
 static LogicalResult printOperation(KokkosCppEmitter &emitter, scf::ParallelOp op, KokkosParallelEnv &kokkosParallelEnv) {
   if (kokkosParallelEnv.useSerialLoop())
     return printSeralOperation(emitter, op, kokkosParallelEnv);
+
+  if(emitter.parallelOffloadable.find(op) != emitter.parallelOffloadable.end())
+  {
+    // have a top-level parallel, so print a comment about whether it's offloadable
+    bool offloadable = emitter.parallelOffloadable[op];
+    emitter << "// This scf.parallel will execute on " << (offloadable ? "device" : "host") << '\n';
+  }
 
   OperandRange lowerBounds = op.getLowerBound();
   OperandRange upperBounds = op.getUpperBound();
@@ -1803,9 +1711,6 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, scf::YieldOp yiel
             auto result = std::get<0>(pair);
             auto operand = std::get<1>(pair);
             os << emitter.getOrCreateName(result) << " = ";
-
-            if (!emitter.hasValueInScope(operand))
-              return yieldOp.emitError("operand value not in scope");
             os << emitter.getOrCreateName(operand);
             return success();
           },
@@ -1824,7 +1729,7 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
     return success();
   case 1:
     os << " " << emitter.getOrCreateName(returnOp.getOperand(0));
-    return success(emitter.hasValueInScope(returnOp.getOperand(0)));
+    return success();
   default:
     os << " std::make_tuple(";
     if (failed(emitter.emitOperandsAndAttributes(*returnOp.getOperation())))
@@ -1835,12 +1740,11 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
 }
 
 static LogicalResult printOperation(KokkosCppEmitter &emitter, ModuleOp moduleOp, KokkosParallelEnv &kokkosParallelEnv) {
-  KokkosCppEmitter::Scope scope(emitter);
-
   for (Operation &op : moduleOp) {
     if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false, kokkosParallelEnv)))
       return failure();
   }
+  emitter.emitAnalysisSummary();
   return success();
 }
 
@@ -1922,7 +1826,6 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
     return success();
   }
   // Otherwise, it's a function definition with body.
-  KokkosCppEmitter::Scope scope(emitter);
   if (failed(emitter.emitTypes(functionOp.getLoc(),
                                functionOp.getResultTypes())))
     return failure();
@@ -1978,9 +1881,6 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
   for (auto it = std::next(blocks.begin()); it != blocks.end(); ++it) {
     Block &block = *it;
     for (BlockArgument &arg : block.getArguments()) {
-      if (emitter.hasValueInScope(arg))
-        return functionOp.emitOpError(" block argument #")
-               << arg.getArgNumber() << " is out of scope";
       if (failed(
               emitter.emitType(block.getParentOp()->getLoc(), arg.getType()))) {
         return failure();
@@ -2343,8 +2243,8 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
 
 KokkosCppEmitter::KokkosCppEmitter(raw_ostream& os, bool enableSparseSupport)
     : os(os), py_os(nullptr), enableSparseSupport(enableSparseSupport) {
-  valueInScopeCount.push(0);
-  labelInScopeCount.push(0);
+  valueCount = 0;
+  labelCount = 0;
   if(enableSparseSupport)
     populateSparseSupportFunctions();
 }
@@ -2352,8 +2252,8 @@ KokkosCppEmitter::KokkosCppEmitter(raw_ostream& os, bool enableSparseSupport)
 KokkosCppEmitter::KokkosCppEmitter(raw_ostream& os, raw_ostream& py_os_, bool enableSparseSupport)
     : os(os), enableSparseSupport(enableSparseSupport) {
   this->py_os = std::make_shared<raw_indented_ostream>(py_os_); 
-  valueInScopeCount.push(0);
-  labelInScopeCount.push(0);
+  valueCount = 0;
+  labelCount = 0;
   if(enableSparseSupport)
     populateSparseSupportFunctions();
 }
@@ -2608,18 +2508,76 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
   return success();
 }
 
+void KokkosCppEmitter::emitAnalysisSummary()
+{
+  os << "/* ** Heterogenous memory analysis summary **\n";
+  os << "Memref storage:\n";
+  //llvm::DenseMap<Value, int> memrefStorage;
+  for(auto ms : memrefStorage)
+  {
+    os << "- " << getOrCreateName(ms.getFirst()) << ": ";
+    switch(ms.getSecond())
+    {
+      case ViewStorageType::HOST:
+        os << "Host\n";
+        break;
+      case ViewStorageType::DEVICE:
+        os << "Device\n";
+        break;
+      case ViewStorageType::DUALVIEW:
+        os << "Host+Device (DualView)\n";
+        break;
+    }
+  }
+  os << "\n";
+  os << "Value ownership:\n";
+  for(auto v : valueOwnership.valueToNode)
+  {
+    os << "- " << getOrCreateName(v.getFirst()) << " is owned by ";
+    auto vn = v.getSecond();
+    if(vn->hasValue())
+    {
+      os << " value " << getOrCreateName(vn->getValue());
+    }
+    else
+    {
+      auto gv = (ValueForestNode_GlobalOp*) vn;
+      os << " global memref " << gv->globalName;
+    }
+    os << "\n";
+  }
+  os << "\n";
+  os << "Memref ownership:\n";
+  for(auto v : memrefOwnership.valueToNode)
+  {
+    os << "- " << getOrCreateName(v.getFirst()) << " is owned by ";
+    auto vn = v.getSecond();
+    if(vn->hasValue())
+    {
+      os << "value " << getOrCreateName(vn->getValue());
+    }
+    else
+    {
+      auto gv = (ValueForestNode_GlobalOp*) vn;
+      os << "global memref " << gv->globalName;
+    }
+    os << "\n";
+  }
+  os << " */\n";
+}
+
 /// Return the existing or a new name for a Value.
 StringRef KokkosCppEmitter::getOrCreateName(Value val) {
-  if (!valueMapper.count(val))
-    valueMapper.insert(val, formatv("v{0}", ++valueInScopeCount.top()));
-  return *valueMapper.begin(val);
+  if (valueMapper.find(val) == valueMapper.end())
+    valueMapper[val] = formatv("v{0}", ++valueCount);
+  return valueMapper[val];
 }
 
 /// Return the existing or a new label for a Block.
 StringRef KokkosCppEmitter::getOrCreateName(Block &block) {
-  if (!blockMapper.count(&block))
-    blockMapper.insert(&block, formatv("label{0}", ++labelInScopeCount.top()));
-  return *blockMapper.begin(&block);
+  if (blockMapper.find(&block) == blockMapper.end())
+    blockMapper[&block] = formatv("label{0}", ++labelCount);
+  return blockMapper[&block];
 }
 
 bool KokkosCppEmitter::shouldMapToUnsigned(IntegerType::SignednessSemantics val) {
@@ -2632,12 +2590,6 @@ bool KokkosCppEmitter::shouldMapToUnsigned(IntegerType::SignednessSemantics val)
     return true;
   }
   llvm_unreachable("Unexpected IntegerType::SignednessSemantics");
-}
-
-bool KokkosCppEmitter::hasValueInScope(Value val) { return valueMapper.count(val) || isScalarConstant(val); }
-
-bool KokkosCppEmitter::hasBlockLabel(Block &block) {
-  return blockMapper.count(&block);
 }
 
 LogicalResult KokkosCppEmitter::emitAttribute(Location loc, Attribute attr) {
@@ -2759,8 +2711,6 @@ LogicalResult KokkosCppEmitter::emitAttribute(Location loc, Attribute attr) {
 
 LogicalResult KokkosCppEmitter::emitOperands(Operation &op) {
   auto emitOperandName = [&](Value result) -> LogicalResult {
-    if (!hasValueInScope(result))
-      return op.emitOpError() << "operand value not in scope";
     if(failed(emitValue(result)))
       return failure();
     return success();
@@ -2806,9 +2756,9 @@ KokkosCppEmitter::emitValue(Value val)
   else
   {
     //If calling this, the value should have already been declared
-    if (!valueMapper.count(val))
+    if (valueMapper.find(val) == valueMapper.end())
       return failure();
-    os << *valueMapper.begin(val);
+    os << valueMapper[val];
     return success();
   }
 }
@@ -2816,15 +2766,6 @@ KokkosCppEmitter::emitValue(Value val)
 LogicalResult KokkosCppEmitter::emitVariableDeclaration(Value result,
                                                   bool trailingSemicolon) {
   auto op = result.getDefiningOp();
-  if (hasValueInScope(result)) {
-    if(op) {
-      return op->emitError(
-          "result variable for the operation already declared");
-    }
-    else {
-      return failure();
-    }
-  }
   Location loc = op ? op->getLoc() : Location(LocationAttr());
   if (failed(emitType(loc, result.getType())))
     return failure();
@@ -2859,8 +2800,6 @@ LogicalResult KokkosCppEmitter::emitAssignPrefix(Operation &op) {
 }
 
 LogicalResult KokkosCppEmitter::emitLabel(Block &block) {
-  if (!hasBlockLabel(block))
-    return block.getParentOp()->emitError("label for block not found");
   // FIXME: Add feature in `raw_indented_ostream` to ignore indent for block
   // label instead of using `getOStream`.
   os.getOStream() << getOrCreateName(block) << ":\n";
