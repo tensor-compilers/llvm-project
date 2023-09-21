@@ -2373,15 +2373,15 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
               // newSparseTensor: result is a sparse tensor, which is a top-level owner of its memory
               // sparseValues*, sparseIndices*, sparsePointers*: result is a memref, whose parent is the sparse tensor
               auto callee = call.getCallee();
-              if(callee.equals("_mlir_ciface_newSparseTensor"))
+              if(callee.equals("newSparseTensor"))
               {
                 Value sparseTensor = call.getResult(0);
                 valueOwnership.addValue(sparseTensor);
               }
               else if(
-                  callee.starts_with("_mlir_ciface_sparseValues") ||
-                  callee.starts_with("_mlir_ciface_sparseIndices") ||
-                  callee.starts_with("_mlir_ciface_sparsePointers") )
+                  callee.starts_with("sparseValues") ||
+                  callee.starts_with("sparseIndices") ||
+                  callee.starts_with("sparsePointers") )
               {
                 // First operand (argument) is the sparse tensor
                 // Only result is a memref that has no memref owner, but the sparse tensor as the value owner
@@ -2533,16 +2533,25 @@ void KokkosCppEmitter::emitAnalysisSummary()
   os << "Value ownership:\n";
   for(auto v : valueOwnership.valueToNode)
   {
-    os << "- " << getOrCreateName(v.getFirst()) << " is owned by ";
     auto vn = v.getSecond();
-    if(vn->hasValue())
+    os << "- " << getOrCreateName(v.getFirst()) << " is ";
+    if(vn->parent)
     {
-      os << " value " << getOrCreateName(vn->getValue());
+      os << "owned by ";
+      auto parent = vn->parent;
+      if(parent->hasValue())
+      {
+        os << "value " << getOrCreateName(parent->getValue());
+      }
+      else
+      {
+        auto gv = (ValueForestNode_GlobalOp*) parent;
+        os << "global memref " << gv->globalName;
+      }
     }
     else
     {
-      auto gv = (ValueForestNode_GlobalOp*) vn;
-      os << " global memref " << gv->globalName;
+      os << "self-owned";
     }
     os << "\n";
   }
@@ -2550,16 +2559,25 @@ void KokkosCppEmitter::emitAnalysisSummary()
   os << "Memref ownership:\n";
   for(auto v : memrefOwnership.valueToNode)
   {
-    os << "- " << getOrCreateName(v.getFirst()) << " is owned by ";
     auto vn = v.getSecond();
-    if(vn->hasValue())
+    os << "- " << getOrCreateName(v.getFirst()) << " is ";
+    if(vn->parent)
     {
-      os << "value " << getOrCreateName(vn->getValue());
+      os << "owned by ";
+      auto parent = vn->parent;
+      if(parent->hasValue())
+      {
+        os << "value " << getOrCreateName(parent->getValue());
+      }
+      else
+      {
+        auto gv = (ValueForestNode_GlobalOp*) parent;
+        os << "global memref " << gv->globalName;
+      }
     }
     else
     {
-      auto gv = (ValueForestNode_GlobalOp*) vn;
-      os << "global memref " << gv->globalName;
+      os << "self-owned";
     }
     os << "\n";
   }
@@ -3630,7 +3648,7 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool e
     return op->emitError("translateToKokkosCpp() can only accept a ModuleOp.");
   }
   //Uncomment to pause so you can attach debugger
-  pauseForDebugger();
+  //pauseForDebugger();
   KokkosCppEmitter emitter(os, enableSparseSupport);
   emitCppBoilerplate(emitter, false, enableSparseSupport);
   KokkosParallelEnv kokkosParallelEnv(false);
@@ -3649,7 +3667,7 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, raw_os
     return op->emitError("translateToKokkosCpp() can only accept a ModuleOp.");
   }
   //Uncomment to pause so you can attach debugger
-  pauseForDebugger();
+  //pauseForDebugger();
   KokkosCppEmitter emitter(os, py_os, enableSparseSupport);
   //Emit the C++ boilerplate to os
   emitCppBoilerplate(emitter, true, enableSparseSupport);
