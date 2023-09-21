@@ -216,12 +216,29 @@ void walkValues(Operation* startOp, Callback cb)
 struct ValueForestNode
 {
   ValueForestNode() = default;
-  ValueForestNode(ValueForestNode* parent_, Value v_)
-    : parent(parent_), v(v_) {}
+  ValueForestNode(ValueForestNode* parent_) : parent(parent_) {}
+  virtual ~ValueForestNode() {}
 
   ValueForestNode* parent;
-  Value v;
   std::vector<ValueForestNode*> children;
+};
+
+// Value node for a normal "Value" - a result of an op
+struct ValueForestNode_Value : public ValueForestNode
+{
+  ValueForestNode_Value(ValueForestNode* parent_, Value value_)
+    : ValueForestNode(parent_), value(value_) {}
+
+  Value value;
+};
+
+// Value node for a GlobalOp, which is a special case because it has no results
+struct ValueForestNode_GlobalOp : public ValueForestNode
+{
+  ValueForestNode_GlobalOp(memref::GlobalOp globalOp_)
+    : ValueForestNode(nullptr), globalOp(globalOp_) {}
+
+  memref::GlobalOp globalOp;
 };
 
 struct ValueForest
@@ -231,7 +248,15 @@ struct ValueForest
   {
     if(valueToNode.find(v) != valueToNode.end())
       return;
-    valueToNode[v] = new ValueForestNode(nullptr, v);
+    valueToNode[v] = new ValueForestNode_Value(nullptr, v);
+  }
+
+  //Add a root GlobalOp (no parent), if it doesn't already exist
+  void addGlobal(memref::GlobalOp g)
+  {
+    if(globalOpToNode.find(g) != globalOpToNode.end())
+      return;
+    globalOpToNode[g] = new ValueForestNode_GlobalOp(g);
   }
 
   //Add a value with parent, if it doesn't already exist.
@@ -245,21 +270,38 @@ struct ValueForest
     parentNode->children.push_back(valueToNode[v]);
   }
 
+  //Add a value with GlobalOp parent, if it doesn't already exist.
+  //(The parent must already exist, though)
+  void addValue(Value v, memref::GlobalOp parent)
+  {
+    if(valueToNode.find(v) != valueToNode.end())
+      return;
+    ValueForestNode* parentNode = globalOpToNode[parent];
+    valueToNode[v] = new ValueForestNode(parentNode, v);
+    parentNode->children.push_back(valueToNode[v]);
+  }
+
   bool isRoot(Value v)
   {
     return valueToNode[v]->parent == nullptr;
   }
 
-  Value getTopParent(Value v)
+  // From n, walk up parents to the top-level owning Value or GlobalOp
+  ValueForestNode* getTopParent(ValueForestNode* n)
   {
-    auto n = valueToNode[v];
     if(n->parent)
-      return getTopParent(n->v);
-    //v has no parent, so return v
-    return v;
+      return getTopParent(n->parent);
+    //n's parent is nullptr, so it is the top parent
+    return n;
+  }
+
+  ValueForestNode* getTopParent(Value v)
+  {
+    return getTopParent(valueToNode[v]);
   }
 
   llvm::DenseMap<Value, ValueForestNode*> valueToNode;
+  llvm::DenseMap<memref::GlobalOp, ValueForestNode*> globalOpToNode;
 };
 
 namespace {
@@ -2337,7 +2379,7 @@ void KokkosCppEmitter::populateSparseSupportFunctions()
 LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
 {
   // Step 1: determine memref ownership (populate valueOwnership and memrefOwnership)
-  // - First, log all memref-typed BlockArguments as self-owning
+  //   First, log all memref-typed BlockArguments as self-owning
   startOp->walk(
       [&](Block* block)
       {
@@ -2350,7 +2392,7 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
           }
         }
       });
-  // - Next, walk through operations and record ownership for any memrefs that get generated
+  //   Next, walk through operations and record ownership for any memrefs that get generated
   startOp->walk<mlir::WalkOrder::PreOrder>(
       [&](Operation* op)
       {
@@ -2370,20 +2412,72 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
         // - memref::CastOp
         //
         // And finally, these generate memrefs which are owned by a non-memref parent:
-        // - func::CallOp to functions _mlir_ciface_sparse[Values, Indices, Pointers]
+        // - func::CallOp to functions _mlir_ciface_newSparseTensor, and  _mlir_ciface_sparse[Values, Indices, Pointers]
         llvm::TypeSwitch<Operation *, void>(op)
-          .Case<memref::GlobalOp, memref::AllocOp, memref::AllocaOp, memref::CopyOp>([&](auto op)
+          .Case<memref::GlobalOp>([&](memref::GlobalOp globalOp)
             {
-              // these ops all produce exactly one result, which is the self-owned memref
-              Value result = op.getResult(0);
+              valueOwnership.addGlobal(memOp);
+              memrefOwnership.addGlobal(memOp);
+            })
+          .Case<memref::AllocOp, memref::AllocaOp, memref::CopyOp>([&](auto memOp)
+            {
+              // these ops all produce exactly one result, which is a self-owned memref
+              Value result = memOp.getResult(0);
               valueOwnership.addValue(result);
               memrefOwnership.addValue(result);
             })
-          .Case<memref::GetGlobalOp, memref::SubViewOp, memref::CollapseShapeOp, memref::CastOp>([&](auto op)
+          .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp ggo)
             {
+              Value result = ggo.getResult(0);
+              // a GetGlobalOp only refers to the global memref by name, so we have to look up
+              // the name in a map to get the GlobalOp
+              memref::GlobalOp global = this->globalViews[ggo.getName().str()];
+              valueOwnership.addValue(result, global);
+              memrefOwnership.addValue(result, global);
             })
-          .Case<func::FuncOp>([&](auto op)
+          .Case<memref::SubViewOp, memref::CollapseShapeOp, memref::CastOp>([&](auto memOp)
             {
+              // these ops also produce exactly one result
+              Value result = memOp.getResult(0);
+              // but they are each owned by another memref
+              if constexpr(std::is_same_v<decltype(memOp), memref::CollapseShapeOp)
+              {
+                Value owner = memOp.getSrc();
+                valueOwnership.addValue(result, owner);
+                memrefOwnership.addValue(result, owner);
+              }
+              else
+              {
+                Value owner = memOp.getSource();
+                valueOwnership.addValue(result, owner);
+                memrefOwnership.addValue(result, owner);
+              }
+            })
+          .Case<func::CallOp>([&](func::CallOp call)
+            {
+              // The logic here depends on which function is being called.
+              // newSparseTensor: result is a sparse tensor, which is a top-level owner of its memory
+              // sparseValues*, sparseIndices*, sparsePointers*: result is a memref, whose parent is the sparse tensor
+              auto callee = call.getCallee();
+              if(callee.equals("_mlir_ciface_newSparseTensor"))
+              {
+                Value sparseTensor = call.getResult(0);
+                valueOwnership.addValue(sparseTensor);
+              }
+              else if(
+                  callee.starts_with("_mlir_ciface_sparseValues") ||
+                  callee.starts_with("_mlir_ciface_sparseIndices") ||
+                  callee.starts_with("_mlir_ciface_sparsePointers") )
+              {
+                // First operand (argument) is the sparse tensor
+                // Only result is a memref that has no memref owner, but the sparse tensor as the value owner
+                Value sparseTensor = call.getOperands()[0];
+                Value memref = call.getResult(0);
+                // Note: the sparse tensor might not be registered yet (if it's a function parameter).
+                valueOwnership.addValue(sparseTensor);
+                valueOwnership.addValue(memref, sparseTensor);
+                memrefOwnership.addValue(memref);
+              }
             });
       });
   // Step 2: go through all top-level parallel loops 
@@ -2491,12 +2585,6 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
       }
     }
   }
-  /*
-  llvm::DenseMap<scf::ParallelOp, bool> parallelOffloadable;
-  llvm::DenseMap<Value, int> memrefStorage;
-  llvm::DenseMap<Value, bool> parallelDepth;
-  llvm::DenseMap<Value, bool> parallelTreeMaxDepth;
-  */
   return success();
 }
 
