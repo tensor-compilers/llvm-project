@@ -217,7 +217,9 @@ struct ValueForestNode
 {
   ValueForestNode() = default;
   ValueForestNode(ValueForestNode* parent_) : parent(parent_) {}
-  virtual ~ValueForestNode() {}
+
+  virtual bool hasValue() = 0;
+  virtual Value getValue() = 0;
 
   ValueForestNode* parent;
   std::vector<ValueForestNode*> children;
@@ -229,6 +231,9 @@ struct ValueForestNode_Value : public ValueForestNode
   ValueForestNode_Value(ValueForestNode* parent_, Value value_)
     : ValueForestNode(parent_), value(value_) {}
 
+  bool hasValue() override {return true;}
+  Value getValue() override {return value;}
+
   Value value;
 };
 
@@ -236,9 +241,15 @@ struct ValueForestNode_Value : public ValueForestNode
 struct ValueForestNode_GlobalOp : public ValueForestNode
 {
   ValueForestNode_GlobalOp(memref::GlobalOp globalOp_)
-    : ValueForestNode(nullptr), globalOp(globalOp_) {}
+    : ValueForestNode(nullptr), globalName(globalOp_.getSymName()) {}
 
-  memref::GlobalOp globalOp;
+  bool hasValue() override {return false;}
+  Value getValue() override
+  {
+    return Value();
+  }
+
+  llvm::StringRef globalName;
 };
 
 struct ValueForest
@@ -254,9 +265,9 @@ struct ValueForest
   //Add a root GlobalOp (no parent), if it doesn't already exist
   void addGlobal(memref::GlobalOp g)
   {
-    if(globalOpToNode.find(g) != globalOpToNode.end())
+    if(globalOpToNode.find(g.getSymName()) != globalOpToNode.end())
       return;
-    globalOpToNode[g] = new ValueForestNode_GlobalOp(g);
+    globalOpToNode[g.getSymName()] = new ValueForestNode_GlobalOp(g);
   }
 
   //Add a value with parent, if it doesn't already exist.
@@ -266,18 +277,18 @@ struct ValueForest
     if(valueToNode.find(v) != valueToNode.end())
       return;
     ValueForestNode* parentNode = valueToNode[parent];
-    valueToNode[v] = new ValueForestNode(parentNode, v);
+    valueToNode[v] = new ValueForestNode_Value(parentNode, v);
     parentNode->children.push_back(valueToNode[v]);
   }
 
   //Add a value with GlobalOp parent, if it doesn't already exist.
   //(The parent must already exist, though)
-  void addValue(Value v, memref::GlobalOp parent)
+  void addValue(Value v, llvm::StringRef parentName)
   {
     if(valueToNode.find(v) != valueToNode.end())
       return;
-    ValueForestNode* parentNode = globalOpToNode[parent];
-    valueToNode[v] = new ValueForestNode(parentNode, v);
+    ValueForestNode* parentNode = globalOpToNode[parentName];
+    valueToNode[v] = new ValueForestNode_Value(parentNode, v);
     parentNode->children.push_back(valueToNode[v]);
   }
 
@@ -301,7 +312,7 @@ struct ValueForest
   }
 
   llvm::DenseMap<Value, ValueForestNode*> valueToNode;
-  llvm::DenseMap<memref::GlobalOp, ValueForestNode*> globalOpToNode;
+  llvm::DenseMap<llvm::StringRef, ValueForestNode*> globalOpToNode;
 };
 
 namespace {
@@ -465,7 +476,7 @@ struct KokkosCppEmitter {
 
   void registerGlobalView(memref::GlobalOp op)
   {
-    globalViews[op.getSymName().str()] = op;
+    globalViews.push_back(op);
   }
 
   //Is v a scalar constant?
@@ -573,11 +584,10 @@ private:
   //Bookeeping for scalar constants (individual integer and floating-point values)
   mutable llvm::DenseMap<Value, arith::ConstantOp> scalarConstants;
 
-  //Bookeeping for Kokkos::Views in global scope.
-  //Each key is a global memrefs's name, and each value is the op that generated it.
+  //List of Kokkos::Views (memrefs) in global scope.
   //Each element has a name, element type, total size and whether it is intialized.
   //If initialized, ${name}_initial is assumed to be a global 1D host array with the data.
-  llvm::DenseMap<std::string, memref::GlobalOp> globalViews;
+  std::vector<memref::GlobalOp> globalViews;
 
   // This is a string-string map
   // Keys are the names of sparse runtime support functions as they appear in the IR
@@ -2416,31 +2426,35 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
         llvm::TypeSwitch<Operation *, void>(op)
           .Case<memref::GlobalOp>([&](memref::GlobalOp globalOp)
             {
-              valueOwnership.addGlobal(memOp);
-              memrefOwnership.addGlobal(memOp);
-            })
-          .Case<memref::AllocOp, memref::AllocaOp, memref::CopyOp>([&](auto memOp)
-            {
-              // these ops all produce exactly one result, which is a self-owned memref
-              Value result = memOp.getResult(0);
-              valueOwnership.addValue(result);
-              memrefOwnership.addValue(result);
+              valueOwnership.addGlobal(globalOp);
+              memrefOwnership.addGlobal(globalOp);
             })
           .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp ggo)
             {
-              Value result = ggo.getResult(0);
-              // a GetGlobalOp only refers to the global memref by name, so we have to look up
-              // the name in a map to get the GlobalOp
-              memref::GlobalOp global = this->globalViews[ggo.getName().str()];
-              valueOwnership.addValue(result, global);
-              memrefOwnership.addValue(result, global);
+              Value result = ggo.getResult();
+              auto globalName = ggo.getName();
+              valueOwnership.addValue(result, globalName);
+              memrefOwnership.addValue(result, globalName);
+            })
+          .Case<memref::CopyOp>([&](auto memOp)
+            {
+              Value result = memOp.getTarget();
+              valueOwnership.addValue(result);
+              memrefOwnership.addValue(result);
+            })
+          .Case<memref::AllocOp, memref::AllocaOp>([&](auto memOp)
+            {
+              // these ops all produce exactly one result, which is a self-owned memref
+              Value result = memOp.getResult();
+              valueOwnership.addValue(result);
+              memrefOwnership.addValue(result);
             })
           .Case<memref::SubViewOp, memref::CollapseShapeOp, memref::CastOp>([&](auto memOp)
             {
               // these ops also produce exactly one result
-              Value result = memOp.getResult(0);
+              Value result = memOp.getResult();
               // but they are each owned by another memref
-              if constexpr(std::is_same_v<decltype(memOp), memref::CollapseShapeOp)
+              if constexpr(std::is_same_v<decltype(memOp), memref::CollapseShapeOp>)
               {
                 Value owner = memOp.getSrc();
                 valueOwnership.addValue(result, owner);
@@ -2576,10 +2590,16 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
           {
             for(auto child : node->children)
               visit(child);
-            int nodeStorageType = memrefStorage[node->v];
-            for(auto child : node->children)
-              nodeStorageType |= memrefStorage[child->v];
-            memrefStorage[node->v] = nodeStorageType;
+            if(node->hasValue())
+            {
+              int nodeStorageType = memrefStorage[node->getValue()];
+              for(auto child : node->children)
+              {
+                if(child->hasValue())
+                  nodeStorageType |= memrefStorage[child->getValue()];
+              }
+              memrefStorage[node->getValue()] = nodeStorageType;
+            }
           };
         visit(node.getSecond());
       }
@@ -3373,10 +3393,9 @@ LogicalResult KokkosCppEmitter::emitInitAndFinalize()
   os.indent();
   os << "Kokkos::initialize();\n";
   //For each global view: allocate it, and if there is initializing data, copy it
-  for(auto& gv : globalViews)
+  for(auto& op : globalViews)
   {
-    std::string name = gv.getFirst();
-    memref::GlobalOp op = gv.getSecond();
+    auto name = op.getSymName();
     os << "{\n";
     os.indent();
     os << name << " = ";
@@ -3409,11 +3428,9 @@ LogicalResult KokkosCppEmitter::emitInitAndFinalize()
   os << "extern \"C\" void kokkos_mlir_finalize()\n";
   os << "{\n";
   os.indent();
-  for(auto& gv : globalViews)
+  for(auto& op : globalViews)
   {
-    std::string name = gv.getFirst();
-    memref::GlobalOp op = gv.getSecond();
-    os << name << " = ";
+    os << op.getSymName() << " = ";
     if(failed(emitType(op.getLoc(), op.getType())))
       return failure();
     os << "();\n";
