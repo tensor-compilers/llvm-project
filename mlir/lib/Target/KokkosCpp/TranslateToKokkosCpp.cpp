@@ -2475,6 +2475,16 @@ LogicalResult KokkosCppEmitter::analyzeModule(ModuleOp startOp)
                   memrefStorage[operand] = ViewStorageType::HOST;
               }
             }
+            // Also check results for certain functions (sparseValues*, sparseIndices*, sparsePointers*)
+            // Memrefs produced by these calls are always on host, at least initially
+            func::CallOp call = dyn_cast<func::CallOp>(op);
+            auto callee = call.getCallee();
+            if(callee.starts_with("sparseValues") ||
+                callee.starts_with("sparseIndices") ||
+                callee.starts_with("sparsePointers"))
+            {
+              memrefStorage[call.getResult(0)] |= ViewStorageType::HOST;
+            }
           }
           return mlir::WalkResult::advance();
         });
