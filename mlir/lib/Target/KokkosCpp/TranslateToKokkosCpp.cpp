@@ -649,14 +649,22 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
   Operation *operation = op.getOperation();
   OpResult result = operation->getResult(0);
   MemRefType type = op.getType();
+  auto name = emitter.getOrCreateName(result);
 
-  // Emit a variable declaration.
+  // Allocate the host and/or device view (depending on the result's storage mode).
+  // If the mode is DUALVIEW, make the host view first. Then make the device view a mirror of it.
+  // That way, if mem_space == HostSpace, we don't make two host allocations
+  int storageMode = emitter.memrefStorage[result];
+  if(storageMode & ViewStorageType::HOST)
+  {
+    if (failed(emitter.emitType(op.getLoc(), type, false, false)))
+      return failure();
+    emitter << " " << name << "(
+  }
   if (failed(emitter.emitAssignPrefix(*operation)))
     return failure();
 
-  if (failed(emitter.emitType(op.getLoc(), type)))
-    return failure();
-  emitter << "(Kokkos::view_alloc(Kokkos::WithoutInitializing, \"" << emitter.getOrCreateName(result) << "\")";
+  emitter << "(Kokkos::view_alloc(Kokkos::WithoutInitializing, \"" << << "\")";
   for(auto dynSize : op.getDynamicSizes())
   {
     emitter << ", ";
@@ -3429,7 +3437,12 @@ LogicalResult KokkosCppEmitter::emitPythonBoilerplate()
   return success();
 }
 
-LogicalResult KokkosCppEmitter::emitType(Location loc, Type type, bool forSparseRuntime) {
+// forSparseRuntime and onDevice control how memref types are emitted.
+// If forSparseRuntime is true, then use StridedMemRefType<T,N>
+// Otherwise, use Kokkos::View<...>.
+//  If onDevice is true, use mem_space (which is Kokkos::DefaultExecutionSpace::memory_space)
+//  If onDevice is false, use Kokkos::HostSpace
+LogicalResult KokkosCppEmitter::emitType(Location loc, Type type, bool forSparseRuntime, bool onDevice = false) {
   if (auto iType = type.dyn_cast<IntegerType>()) {
     switch (iType.getWidth()) {
     case 1:
@@ -3495,7 +3508,8 @@ LogicalResult KokkosCppEmitter::emitType(Location loc, Type type, bool forSparse
             os << '*';
         }
       }
-      os << ", Kokkos::LayoutRight>";
+      os << ", Kokkos::LayoutRight, ";
+      os << (onDevice ? "mem_space" : "Kokkos::HostSpace") << ">";
     }
     return success();
   }
@@ -3503,7 +3517,8 @@ LogicalResult KokkosCppEmitter::emitType(Location loc, Type type, bool forSparse
     os << "Kokkos::View<";
     if (failed(emitType(loc, mrType.getElementType())))
       return failure();
-    os << "*>";
+    os << "*, ";
+    os << (onDevice ? "mem_space" : "Kokkos::HostSpace") << ">";
     return success();
   }
   if (auto mrType = type.dyn_cast<LLVM::LLVMPointerType>()) {
@@ -3515,15 +3530,22 @@ LogicalResult KokkosCppEmitter::emitType(Location loc, Type type, bool forSparse
   return emitError(loc, "cannot emit type ") << type << "\n";
 }
 
-LogicalResult KokkosCppEmitter::emitTypes(Location loc, ArrayRef<Type> types, bool forSparseRuntime) {
+LogicalResult KokkosCppEmitter::emitTypes(Location loc, ArrayRef<Type> types, bool forSparseRuntime, bool onDevice = false) {
   switch (types.size()) {
   case 0:
     os << "void";
     return success();
   case 1:
-    return emitType(loc, types.front(), forSparseRuntime);
+    return emitType(loc, types.front(), forSparseRuntime, onDevice);
   default:
-    return emitTupleType(loc, types);
+    {
+      if(onDevice)
+      {
+        //Do not support host/device separation in tuple types yet
+        return failure();
+      }
+      return emitTupleType(loc, types, onDevice);
+    }
   }
 }
 
@@ -3553,7 +3575,8 @@ static void emitCppBoilerplate(KokkosCppEmitter &emitter, bool enablePythonWrapp
   emitter << "#include <type_traits>\n";
   emitter << "#include <cstdint>\n";
   emitter << "#include <unistd.h>\n";
-  emitter << "using exec_space = Kokkos::DefaultExecutionSpace;\n\n";
+  emitter << "using exec_space = Kokkos::DefaultExecutionSpace;\n";
+  emitter << "using mem_space = typename exec_space::memory_space;\n\n";
   if(enablePythonWrapper)
   {
     //Will later add definitions for these functions.
