@@ -3160,12 +3160,6 @@ LogicalResult KokkosCppEmitter::emitOperation(Operation &op, bool trailingSemico
     // "// arith.constant" comment and trailing semicolon.
     return printOperation(*this, constantOp);
   }
-  if(auto indexCastOp = dyn_cast<arith::IndexCastOp>(&op)) {
-    return printOperation(*this, indexCastOp);
-  }
-  if(auto sIToFPOp = dyn_cast<arith::SIToFPOp>(&op)) {
-    return printOperation(*this, sIToFPOp);
-  }
   os << "// " << op.getName() << '\n';
   LogicalResult status =
       llvm::TypeSwitch<Operation *, LogicalResult>(&op)
@@ -3182,7 +3176,7 @@ LogicalResult KokkosCppEmitter::emitOperation(Operation &op, bool trailingSemico
           .Case<scf::ForOp, scf::WhileOp, scf::IfOp, scf::YieldOp, scf::ConditionOp, scf::ParallelOp, scf::ReduceOp>(
               [&](auto op) { return printOperation(*this, op, kokkosParallelEnv); })
           // Arithmetic ops: general
-          .Case<arith::FPToUIOp, arith::NegFOp, arith::CmpFOp, arith::CmpIOp, arith::SelectOp>(
+          .Case<arith::FPToUIOp, arith::NegFOp, arith::CmpFOp, arith::CmpIOp, arith::SelectOp, arith::IndexCastOp, arith::SIToFPOp>(
               [&](auto op) { return printOperation(*this, op); })
           // Arithmetic ops: standard binary infix operators. All have the same syntax "result = lhs <operator> rhs;".
           // ArithBinaryInfixOperator<Op>::get() will provide the <operator>.
