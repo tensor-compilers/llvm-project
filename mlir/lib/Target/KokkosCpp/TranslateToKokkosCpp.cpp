@@ -794,6 +794,28 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
 }
 
 static LogicalResult printOperation(KokkosCppEmitter &emitter,
+                                    arith::IndexCastOp indexCastOp) {
+  if(failed(emitter.emitType(indexCastOp.getLoc(), indexCastOp.getOut().getType())))
+    return failure();
+  emitter << ' ' << emitter.getOrCreateName(indexCastOp.getOut()) << " = ";
+  if(failed(emitter.emitValue(indexCastOp.getIn())))
+    return failure();
+  emitter << ";\n";
+  return success();
+}
+
+static LogicalResult printOperation(KokkosCppEmitter &emitter,
+                                    arith::SIToFPOp sIToFPOp) {
+  if(failed(emitter.emitType(sIToFPOp.getLoc(), sIToFPOp.getOut().getType())))
+    return failure();
+  emitter << ' ' << emitter.getOrCreateName(sIToFPOp.getOut()) << " = ";
+  if(failed(emitter.emitValue(sIToFPOp.getIn())))
+    return failure();
+  emitter << ";\n";
+  return success();
+}
+
+static LogicalResult printOperation(KokkosCppEmitter &emitter,
                                     arith::FPToUIOp op) {
   //In C, float->unsigned conversion when input is negative is implementation defined, but MLIR says it should convert to the nearest value (0)
   if(failed(emitter.emitType(op.getLoc(), op.getOut().getType())))
@@ -2933,6 +2955,12 @@ LogicalResult KokkosCppEmitter::emitOperation(Operation &op, bool trailingSemico
     //arith.constant is not directly emitted in the code, so always skip the
     // "// arith.constant" comment and trailing semicolon.
     return printOperation(*this, constantOp);
+  }
+  if(auto indexCastOp = dyn_cast<arith::IndexCastOp>(&op)) {
+    return printOperation(*this, indexCastOp);
+  }
+  if(auto sIToFPOp = dyn_cast<arith::SIToFPOp>(&op)) {
+    return printOperation(*this, sIToFPOp);
   }
   os << "// " << op.getName() << '\n';
   LogicalResult status =
