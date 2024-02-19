@@ -205,9 +205,13 @@ Value MemRefDescriptor::bufferPtr(OpBuilder &builder, Location loc,
   auto [strides, offsetCst] = getStridesAndOffset(type);
 
   Value ptr = alignedPtr(builder, loc);
+  Value descOffset = offset(builder, loc);
+  Type elementType = converter.convertType(type.getElementType());
+  Value srcPtr = builder.create<LLVM::GEPOp>(loc, ptr.getType(), elementType,
+                                             ptr, descOffset);
   // For zero offsets, we already have the base pointer.
   if (offsetCst == 0)
-    return ptr;
+    return srcPtr;
 
   // Otherwise add the offset to the aligned base.
   Type indexType = converter.getIndexType();
@@ -215,8 +219,7 @@ Value MemRefDescriptor::bufferPtr(OpBuilder &builder, Location loc,
       ShapedType::isDynamic(offsetCst)
           ? offset(builder, loc)
           : createIndexAttrConstant(builder, loc, indexType, offsetCst);
-  Type elementType = converter.convertType(type.getElementType());
-  ptr = builder.create<LLVM::GEPOp>(loc, ptr.getType(), elementType, ptr,
+  ptr = builder.create<LLVM::GEPOp>(loc, ptr.getType(), elementType, srcPtr,
                                     offsetVal);
   return ptr;
 }
