@@ -33,8 +33,8 @@ struct SparseCompilerOptions
   // TODO(57514): These options are duplicated in Passes.td.
   PassOptions::Option<mlir::SparseParallelizationStrategy> parallelization{
       *this, "parallelization-strategy",
-      ::llvm::cl::desc("Set the parallelization strategy"),
-      ::llvm::cl::init(mlir::SparseParallelizationStrategy::kNone),
+      ::llvm::cl::desc("Set the parallelization strategy (default: parallelize every possible loop)"),
+      ::llvm::cl::init(mlir::SparseParallelizationStrategy::kAnyStorageAnyLoop),
       llvm::cl::values(
           clEnumValN(mlir::SparseParallelizationStrategy::kNone, "none",
                      "Turn off sparse parallelization."),
