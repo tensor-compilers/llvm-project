@@ -358,6 +358,7 @@ def SparseKokkosCodegen : Pass<"sparse-kokkos-codegen", "ModuleOp"> {
   let dependentDialects = [
     "arith::ArithDialect",
     "bufferization::BufferizationDialect",
+    "emitc::EmitCDialect",
     "linalg::LinalgDialect",
     "memref::MemRefDialect",
     "scf::SCFDialect",
