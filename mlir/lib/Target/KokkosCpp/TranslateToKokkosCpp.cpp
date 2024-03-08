@@ -1623,7 +1623,7 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, scf::ParallelOp o
     }
     emitter << "}),\n";
   }
-  if (!usedInsideTeamPolicy)
+  if (true || !usedInsideTeamPolicy)
     emitter << "KOKKOS_LAMBDA(";
   else
     emitter << "[&](const ";
@@ -3638,9 +3638,12 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool e
   //pauseForDebugger();
   KokkosCppEmitter emitter(os, enableSparseSupport);
   emitCppBoilerplate(emitter, false, enableSparseSupport);
-  KokkosParallelEnv kokkosParallelEnv(false);
+  KokkosParallelEnv kokkosParallelEnv(true);
   //Emit the actual module (global variables and functions)
   if(failed(emitter.emitOperation(*op, /*trailingSemicolon=*/false, kokkosParallelEnv)))
+    return failure();
+  // Emit the init and finalize function definitions.
+  if (failed(emitter.emitInitAndFinalize()))
     return failure();
   return success();
 }
