@@ -3642,6 +3642,9 @@ LogicalResult emitc::translateToKokkosCpp(Operation *op, raw_ostream &os, bool e
   //Emit the actual module (global variables and functions)
   if(failed(emitter.emitOperation(*op, /*trailingSemicolon=*/false, kokkosParallelEnv)))
     return failure();
+  // Emit the init and finalize function definitions.
+  if (failed(emitter.emitInitAndFinalize()))
+    return failure();
   return success();
 }
 
