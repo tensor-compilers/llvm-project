@@ -98,11 +98,16 @@ struct KokkosParallelEnv{
   KokkosParallelEnv(bool useHierarchicalParallelism) {
     useHierarchicalParallelism_ = useHierarchicalParallelism;
     parallelLvl_ = 0;
+    parallelDepth_ = -1;
+
+    insideTeamRange_ = false;
+    insideTeamThreadRange_ = false;
+    insideThreadVectorRange_ = false;
+    insideTeamVectorRange_ = false;
     useTeamRange_ = false;
     useTeamThreadRange_ = false;
     useThreadVectorRange_ = false;
     useTeamVectorRange_ = false;
-    parallelDepth_ = -1;
   }
 
   KokkosParallelEnv(const KokkosParallelEnv &kokkosParallelEnv) {
