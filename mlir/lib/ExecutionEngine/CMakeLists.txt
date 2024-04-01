@@ -150,6 +150,7 @@ if(LLVM_ENABLE_PIC)
     MLIRSparseTensorRuntime
     )
   set_property(TARGET mlir_c_runner_utils PROPERTY CXX_STANDARD 17)
+  target_compile_options(mlir_c_runner_utils PRIVATE $<$<CONFIG:Debug>: "-O0">)
   target_compile_definitions(mlir_c_runner_utils PRIVATE mlir_c_runner_utils_EXPORTS)
 
   add_mlir_library(mlir_runner_utils

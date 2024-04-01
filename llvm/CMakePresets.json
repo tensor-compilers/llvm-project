@@ -60,6 +60,7 @@
       "configurePreset": "default",
       "targets": [
         "lib/libmlir_c_runner_utils.so",
+        "lib/libMLIRExecutionEngine.a",
         "mlir-opt",
         "mlir-translate",
         "libmlir_runner_utils.so",
