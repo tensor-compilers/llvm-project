@@ -54,13 +54,30 @@
   ],
   "buildPresets": [
     {
+      "name": "base",
+      "displayName": "base",
+      "description": "base",
+      "configurePreset": "default",
+      "targets": [
+        "lib/libmlir_c_runner_utils.so",
+        "mlir-opt",
+        "mlir-translate",
+        "libmlir_runner_utils.so",
+        "llc",
+        "opt",
+        "llvm-symbolizer"
+      ]
+    },
+    {
       "name": "default",
+      "inherits": "base",
       "displayName": "Default",
       "description": "Default preset",
       "configurePreset": "default"
     },
     {
       "name": "notchpeak",
+      "inherits": "base",
       "displayName": "notchpeak",
       "description": "Default preset for notchpeak",
       "configurePreset": "notchpeak"
