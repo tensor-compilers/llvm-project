@@ -2476,7 +2476,7 @@ void KokkosCppEmitter::populateSparseSupportFunctions()
         "sparseValuesI64"}) {
     registerCIface(true, funcName);
   }
-  for (std::string funcName : {"getSlice"}) {
+  for (std::string funcName : {"getSlice", "krs_getRank"}) {
     registerCIface(false, funcName);
   }
   registerCIface(false, "lexInsertI8");
