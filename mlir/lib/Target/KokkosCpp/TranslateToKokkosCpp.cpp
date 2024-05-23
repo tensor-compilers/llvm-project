@@ -2197,6 +2197,20 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
       }
     }
   }
+  else {
+    for(size_t i = 0; i < numParams; i++)
+    {
+      auto paramType = ftype.getInput(i);
+      if(auto memrefType = paramType.dyn_cast<MemRefType>())
+      {
+        os << "auto param" << i << "_view = stridedMemrefToView<";
+        if(failed(emitter.emitType(functionOp.getLoc(), paramType)))
+          return failure();
+        os << ">(*param" << i << ");\n";
+      }
+    }
+  }
+  
   os << "auto results = " << functionOpName << "(";
   //Construct a Kokkos::View for each memref input, from raw pointer.
   for(size_t i = 0; i < numParams; i++)
@@ -2211,6 +2225,9 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
       if(failed(emitter.emitType(functionOp.getLoc(), paramType)))
         return failure();
       os << "(param" << i << "_buf.data())";
+    }
+    else if (memrefType) {
+      os << "param" << i << "_view";
     }
     else
     {
@@ -2242,6 +2259,13 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
       else
         os << "std::get<" << i << ">(results)";
       os << ".data(), " << span << "));\n";
+    }
+    else if(memrefType) {
+      os << "ret" << i << " = ";
+      if(numResults == size_t(1))
+        os << "results.data();\n";
+      else
+        os << "std::get<" << i << ">(results);\n";
     }
     else
     {
