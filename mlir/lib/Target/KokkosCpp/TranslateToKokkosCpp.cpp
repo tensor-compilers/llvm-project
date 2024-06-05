@@ -801,13 +801,53 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter,
   {
     return op.emitError("strided subviews not supported yet in memref.copy.");
   }
+  bool zeroOut = false;
+  //check if AnonymousSpace
+  if(emitter.memrefSpaces[op.getTarget()] == MemSpace::General || emitter.memrefSpaces[op.getSource()] == MemSpace::General) {
+    emitter << "// deep-copy not emitted as one of the space is AnonymousSpace\n";  
+    return success();
+  }
+  else {
+    emitter << "// deep-copy emitted as none of the space is AnonymousSpace "; 
+    if(emitter.memrefSpaces[op.getTarget()] == MemSpace::Host)
+      emitter << "Host ";
+    else if(emitter.memrefSpaces[op.getTarget()] == MemSpace::Device)
+      emitter << "Device ";
+    else if(emitter.memrefSpaces[op.getTarget()] == MemSpace::General)
+      emitter << "General ";
+    else
+      emitter << "None ";
+    if(emitter.memrefSpaces[op.getSource()] == MemSpace::Host)
+      emitter << "Host ";
+    else if(emitter.memrefSpaces[op.getSource()] == MemSpace::Device)
+      emitter << "Device ";
+    else if(emitter.memrefSpaces[op.getSource()] == MemSpace::General)
+      emitter << "General ";
+    else
+      emitter << "None ";
+    emitter << " \n";
+    emitter << "// ";
+    emitter.emitType(op.getLoc(), op.getTarget().getType().dyn_cast<MemRefType>());
+    emitter << "   ";
+    emitter.emitType(op.getLoc(), op.getSource().getType().dyn_cast<MemRefType>());
+    emitter << "   ";
+    if(failed(emitter.emitValue(op.getTarget())))
+      return failure();
+    emitter << "   ";
+    if(failed(emitter.emitValue(op.getSource())))
+      return failure();
+    emitter << " \n";
+    zeroOut = true;
+  }
   // Note: operands coming in will both be in HostSpace, since
   // gpu-gpu, gpu-host and host-gpu copies will use gpu.memcpy instead.
   emitter << "Kokkos::deep_copy(Kokkos::DefaultHostExecutionSpace(), ";
   if(failed(emitter.emitValue(op.getTarget())))
     return failure();
   emitter << ", ";
-  if(failed(emitter.emitValue(op.getSource())))
+  if(zeroOut)
+    emitter << "0 ";
+  else if(failed(emitter.emitValue(op.getSource())))
     return failure();
   emitter << ")";
   return success();
@@ -2203,10 +2243,12 @@ static LogicalResult printOperation(KokkosCppEmitter &emitter, func::FuncOp func
       auto paramType = ftype.getInput(i);
       if(auto memrefType = paramType.dyn_cast<MemRefType>())
       {
-        os << "auto param" << i << "_view = stridedMemrefToView<";
-        if(failed(emitter.emitType(functionOp.getLoc(), paramType)))
+        os << "auto param" << i << "_view = stridedMemrefToView<Kokkos::View<";
+        if(failed(emitter.emitType(functionOp.getLoc(), memrefType.getElementType())))
           return failure();
-        os << ">(*param" << i << ");\n";
+        for(size_t i = 0; i < memrefType.getShape().size(); i++)
+          os << "*";
+        os << ", Kokkos::LayoutRight, Kokkos::HostSpace>>(*param" << i << ");\n";
       }
     }
   }
