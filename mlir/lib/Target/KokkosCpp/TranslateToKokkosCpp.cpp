@@ -2494,6 +2494,7 @@ void KokkosCppEmitter::populateSparseSupportFunctions()
   // Now the functions _not_ prefixed with _mlir_ciface_
   registerNonPrefixed(false, "endInsert");
   registerNonPrefixed(false, "sparseDimSize");
+  registerNonPrefixed(false, "sparseLvlSize");
 }
 
 /// Return the existing or a new name for a Value.
